@@ -20,7 +20,7 @@ typedef u8 aes_word[4];
 #ifndef AES_CORE_API
 #define AES_CORE_API static inline
 #endif
-#define AES_IDX(r,c) ((r)+((c)<<2))
+#define AES_IDX(r,c) ((r)|((c)<<2))
 
 GF_API
 u8 gf_2x(u8 b) {
