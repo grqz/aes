@@ -50,10 +50,13 @@ int main(void) {
         0xd5, 0xff, 0xcf, 0x6f, 0xc5, 0xac, 0x4d, 0x69, 0x72, 0x21, 0x87, 0x42, 0x1a, 0x7f, 0x17, 0x0b
     };
     u64 ret = aes_ghash(s, d, sizeof(d)>>4);
-    assert(ret == 7);
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 16; ++i)
         printf("%02hhx%c", d[i], " \n"[i==15]);
+    for (int i = 0; i < 16; ++i) {
+        if (d[i] != expected[i])
+            printf("\n%x got %x, exp %x\n", i, d[i], expected[i]);
         assert(d[i] == expected[i]);
     }
-    return ret != 7 && EXIT_FAILURE;
+    assert(ret == (sizeof(d)>>4));
+    return ret != (sizeof(d)>>4) && EXIT_FAILURE;
 }

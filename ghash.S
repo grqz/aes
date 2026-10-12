@@ -50,7 +50,6 @@ global aes256_ctr_vy128
 ; P1 *data W:16B R:<16*len>B align 16
 ; P2 r64 len
 ; @func r64 (r64 r64 r64)
-; calling convention: win x64-ish
 ; return rax
 ; scratch
 ;     xmm0 xmm1 xmm2 xmm3
@@ -64,14 +63,14 @@ aes_ghash:
     xor eax, eax
     test P2, P2
     jz .errout
-    movdqa xmm6, [rel affine_mat]
-
     WIN_SAVEX 8, xmm6
+
+    movdqa xmm6, [rel affine_mat]
     movdqa xmm1, [P0]
     mov P3, 0x87
     xorps xmm0, xmm0
-    gf2p8affineqb xmm1, xmm6, 0
     movq xmm5, P3
+    gf2p8affineqb xmm1, xmm6, 0
 
     ; we may use:
     ; xmm0..xmm6 incl
@@ -82,41 +81,45 @@ aes_ghash:
     movdqa xmm2, [P1]
     gf2p8affineqb xmm2, xmm6, 0
         add P1, 0x10
-    xorps xmm2, xmm0
+    pxor xmm2, xmm0  ; add last round result
 
     ; perform xmm0 = blockproduct(xmm1, xmm2)
-    ; reduction constant 0xe1 in xmm5
 
-    vpclmullqlqdq xmm0, xmm1, xmm2
+    vpclmullqlqdq xmm0, xmm1, xmm2  ; lsh 0
 
     ; for some reason we have both lqhq and hqlq
-    vpclmullqhqdq xmm3, xmm1, xmm2
-        vpclmulhqlqdq xmm4, xmm1, xmm2
-            pclmulhqhqdq xmm2, xmm1
-        xorps xmm3, xmm4
+    vpclmullqhqdq xmm3, xmm1, xmm2  ; lsh 1q
+        vpclmulhqlqdq xmm4, xmm1, xmm2  ; lsh 1q
+            pclmulhqhqdq xmm2, xmm1  ; TBR
+        pxor xmm3, xmm4  ; combine two lsh 1q
 
-    vpslldq xmm4, xmm3, 8
-        psrldq xmm3, 8
-    xorps xmm0, xmm4
-            xorps xmm2, xmm3
+    ; "repel" qwords (i can't think of a better word)
+    ; so clone and move two xmms in opposite direction, each by 1q
+    ; put 3's lower q into the higher q of 4
+    ; shift the higher q in 3 down to the lower q
+        vpslldq xmm4, xmm3, 8  ; lsh 0
+            psrldq xmm3, 8  ; lsh 2
+        pxor xmm0, xmm4  ; combine like terms
+            pxor xmm2, xmm3  ; let TBR eat the dropped high q
 
     ; now we have:
-    ; xmm0 = lower half to be combined with xmm2 reduced
+    ; xmm0 = lower half
     ; xmm1 = subkey, dont touch
     ; xmm2 = higher half to be reduced
-    ; xmm5 = reduction constant, only has lq
+    ; xmm5 = red const
 
-    vpclmullqlqdq xmm3, xmm2, xmm5  ; TODO: reduce only once
-        pclmulhqlqdq xmm2, xmm5
-                xorps xmm0, xmm3
-            vpslldq xmm4, xmm2, 8
-                xorps xmm0, xmm4
-        pclmulhqlqdq xmm2, xmm5
-    ; just a 8bx8b, xmm2 should be 16b or less
+    vpclmullqlqdq xmm3, xmm2, xmm5  ; reduce accumulated higher half (lqlq lsh 0)
+        pclmulhqlqdq xmm2, xmm5  ; 72 bits lsh 1q! one more reduction required
+            vpslldq xmm4, xmm2, 8  ; deal with the lsh of the lower q
+                pxor xmm3, xmm4  ; eat it
+        pclmulhqlqdq xmm2, xmm5  ; 64b * 8b = 72b, double reduce
+        ; just a 8bx8b/qxq, xmm5 should be 16b/w or less
+                ;pxor xmm3, xmm2  ; then eat double reduced too
+                pxor xmm2, xmm3
 
     inc rax
     dec P2
-        xorps xmm0, xmm2
+                pxor xmm0, xmm2
     test P2, P2
     jnz .loophead
 
@@ -129,7 +132,6 @@ aes_ghash:
 ; P0 *kexp RW:240B align 16
 ; P1 *key R:32B align 16
 ; @func void (r64 r64)
-; calling convention: win x64-ish
 ; scratch
 ;     xmm0 xmm1 xmm2 xmm3
 ;     xmm4 xmm5
@@ -186,7 +188,6 @@ aes256_keyexpansion_aesni:
 ; P0 *exk RW:480B align 32
 ; P1 *key R:32B align 16
 ; @func void (r64 r64)
-; calling convention: win x64-ish
 ; scratch
 ;     xmm0 xmm1 xmm2 xmm3
 ;     xmm4 xmm5
@@ -245,7 +246,6 @@ aes256_keyexpansion_aesni_32:
 ; P0 *state RW:16B align 16
 ; P1 *exk R:240B align 16
 ; @func void (r64 r64)
-; calling convention: win x64-ish
 ; scratch
 ;     xmm0 xmm1 xmm2 xmm3
 ;     xmm4 xmm5
@@ -253,7 +253,7 @@ aes256_keyexpansion_aesni_32:
 ; no shadow space/redzone/stack alignment
 aes256_cipher_aesni:
     movdqa xmm0, [P0]
-    xorps xmm0, [P1]
+    pxor xmm0, [P1]
 %define OFFSET 0x10
 %rep 13
     vaesenc xmm0, [P1 + OFFSET]
@@ -270,7 +270,6 @@ aes256_cipher_aesni:
 ; P3 r64 len of data in 32B chunks
 ; Basic version, don't use.
 ; @func void (r64 r64 r64 r64)
-; calling convention: win x64-ish
 ; scratch
 ;     ymm0 ymm1 ymm2 ymm3
 ;     ymm4 ymm5
@@ -339,12 +338,13 @@ aes256_ctr_vy:
 
 ; AES-256-CTR crypt function operating in 128-byte blocks
 ; Slightly optimised.
+; neg1 4y nospill volatile xmm10 ivwb
+; TODO: experiment with spilled IV 8?
 ; P0 *exk R:480B align 32
 ; P1 *iv R:16B RW:128B align 32
 ; P2 *data RW:<128*len>B align 32
 ; P3 r64 len
 ; @func void (r64 r64 r64 r64)
-; calling convention: win x64-ish
 ; scratch
 ;     ymm0 ymm1 ymm2 ymm3
 ;     ymm4 ymm5 ymm6 ymm7
@@ -352,14 +352,22 @@ aes256_ctr_vy:
 ;     ymm12 ymm13 ymm14 ymm15
 ;     rax r10 r11
 ; no shadow space/redzone/stack alignment
-; RegAlloc: (legacy -8 parallel 4 no spill volatile 0..10)
+; RegAlloc:
 ;     ymm0: RoundKey
 ;     ymm1..4: State & Temp
 ;     ymm5: dq -8, 0, -8, 0
 ;     ymm6..9: IV
 ;     ymm10: Shuffle mask
+; Benchmark (average on 1_000_000 iterations, 64KiB/512 128B chunks):
+; P-core:  4.318 microseconds (14.1342 GiB/s)
+; E-core: 13.946 microseconds ( 4.3765 GiB/s)
 aes256_ctr_vy128:
-    ; TODO: experiment with spilled IV 8 and vpcmpgtq
+    WIN_SAVEX 8, xmm6
+    WIN_SAVEX 0x18, xmm7
+    WIN_PROLOGUE 0x38
+    WIN_SAVEX 0, xmm8
+    WIN_SAVEX 0x10, xmm9
+    WIN_SAVEX 0x20, xmm10
     vmovdqa xmm10, [rel beshufb]
     vinserti128 ymm10, ymm10, xmm10, 1
     vmovdqa xmm0, [P1]
@@ -407,35 +415,35 @@ aes256_ctr_vy128:
         vpshufb ymm4, ymm9, ymm10
 
 .back:
-    vmovaps ymm0, [P0]  ; load first round key
-    vxorps ymm1, ymm1, ymm0
-        vxorps ymm2, ymm2, ymm0
-            vxorps ymm3, ymm3, ymm0
-                vxorps ymm4, ymm4, ymm0
+    vmovdqa ymm0, [P0]  ; load first round key
+    vpxor ymm1, ymm1, ymm0
+        vpxor ymm2, ymm2, ymm0
+            vpxor ymm3, ymm3, ymm0
+                vpxor ymm4, ymm4, ymm0
 %define OFFSET 0x20
 %rep 13
-    vmovaps ymm0, [P0 + OFFSET]
+    vmovdqa ymm0, [P0 + OFFSET]
     vaesenc ymm1, ymm1, ymm0
         vaesenc ymm2, ymm2, ymm0
             vaesenc ymm3, ymm3, ymm0
                 vaesenc ymm4, ymm4, ymm0
 %assign OFFSET OFFSET+0x20
 %endrep
-    vmovaps ymm0, [P0 + OFFSET]
+    vmovdqa ymm0, [P0 + OFFSET]
     vaesenclast ymm1, ymm1, ymm0
         vaesenclast ymm2, ymm2, ymm0
             vaesenclast ymm3, ymm3, ymm0
                 vaesenclast ymm4, ymm4, ymm0
 %undef OFFSET
 
-    vxorps ymm1, [P2]
-        vxorps ymm2, [P2 + 0x20]
-            vxorps ymm3, [P2 + 0x40]
-                vxorps ymm4, [P2 + 0x60]
-    vmovaps [P2], ymm1
-        vmovaps [P2 + 0x20], ymm2
-            vmovaps [P2 + 0x40], ymm3
-                vmovaps [P2 + 0x60], ymm4
+    vpxor ymm1, [P2]
+        vpxor ymm2, [P2 + 0x20]
+            vpxor ymm3, [P2 + 0x40]
+                vpxor ymm4, [P2 + 0x60]
+    vmovdqa [P2], ymm1
+        vmovdqa [P2 + 0x20], ymm2
+            vmovdqa [P2 + 0x40], ymm3
+                vmovdqa [P2 + 0x60], ymm4
 
     ; inc IV
     ; BEGIN: ymm6..9 += ymm5 clobber 1..4
@@ -469,14 +477,19 @@ aes256_ctr_vy128:
     add P2, 0x80
     dec P3
     test P3, P3
-
     jnz .back
 
     vmovaps [P1], ymm6
         vmovaps [P1 + 0x20], ymm7
             vmovaps [P1 + 0x40], ymm8
                 vmovaps [P1 + 0x60], ymm9
-    vzeroupper  ; for performance
+    vzeroupper  ; for xmm interop
+    WIN_LOADX 0, xmm8
+    WIN_LOADX 0x10, xmm9
+    WIN_LOADX 0x20, xmm10
+    WIN_EPILOGUE 0x38
+    WIN_LOADX 8, xmm6
+    WIN_LOADX 0x18, xmm7
     ret
 
 section .data
