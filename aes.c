@@ -20,12 +20,11 @@
 
 #ifdef AES_TEST_ASM
 typedef uint64_t u64;
-extern void aes256_keyexpansion_aesni_sv(void *exk, void const *k);
-extern void aes256_keyexpansion_aesni_32_sv(void *exk, void const *k);
-extern void aes256_cipher_aesni_sv(void *pt, void const *exk);
-extern void aes256_invcipher_aesni_sv(void *ct, void const *exk);
-extern void aes256_ctr_vy_sv(void const *exk, void *iv32, void *text, u64 nchunks);
-extern void aes256_ctr_vy128_sv(void const *exk32, void *iv128, void *text, u64 nchunks);
+extern void aes256_keyexpansion_aesni(void *exk, void const *k);
+extern void aes256_keyexpansion_aesni_32(void *exk, void const *k);
+extern void aes256_cipher_aesni(void *pt, void const *exk);
+extern void aes256_ctr_vy(void const *exk, void *iv32, void *text, u64 nchunks);
+extern void aes256_ctr_vy128(void const *exk32, void *iv128, void *text, u64 nchunks);
 #endif
 
 #ifdef AES_TEST
@@ -190,7 +189,7 @@ void test_aes(void) {
             assert(state[i] == in[i]);
 #ifdef AES_TEST_ASM
         memset(expanded, 0, sizeof expanded);
-        aes256_keyexpansion_aesni_sv(&expanded, &key);
+        aes256_keyexpansion_aesni(&expanded, &key);
         for (i = 0; i < sizeof expanded; ++i) {
             if (expanded[i] != expanded_expected[i]) {
                 printf("a2kx %x g %x, e %x\n", i, expanded[i], expanded_expected[i]);
@@ -198,7 +197,7 @@ void test_aes(void) {
             assert(expanded[i] == expanded_expected[i]);
         }
         memcpy(state, in, sizeof state);
-        aes256_cipher_aesni_sv(&state, &expanded);
+        aes256_cipher_aesni(&state, &expanded);
         for (i = 0; i < sizeof state; ++i) {
             if (state[i] != expected[i]) {
                 printf("a2ci %x g %x, e %x\n", i, expanded[i], expected[i]);
@@ -208,7 +207,7 @@ void test_aes(void) {
         aes256_invcipher(&state, &expanded);
         for (i = 0; i < sizeof state; ++i) {
             if (state[i] != in[i]) {
-                printf("a2ci %x g %x, e %x\n", i, expanded[i], in[i]);
+                printf("a2ic %x g %x, e %x\n", i, expanded[i], in[i]);
             }
             assert(state[i] == in[i]);
         }
@@ -299,8 +298,8 @@ void test_aes(void) {
         alignas(32) unsigned char text[sizeof plain];
         memcpy(iv128, iv16, 16);
         memcpy(text, plain, sizeof plain);
-        aes256_keyexpansion_aesni_sv(&exk16, &key);
-        aes256_keyexpansion_aesni_32_sv(&exk32, &key);
+        aes256_keyexpansion_aesni(&exk16, &key);
+        aes256_keyexpansion_aesni_32(&exk32, &key);
         for (i = 0; i < 15; ++i) {
             for (j = 0; j < 16; ++j) {
                 if (exk16[i << 4 | j] != exk32[i << 5 | j]) {
@@ -313,12 +312,20 @@ void test_aes(void) {
                 assert(exk16[i << 4 | j] == exk32[i << 5 | 16 | j]);
             }
         }
-        aes256_ctr_vy128_sv(&exk32, iv128, text, 4);
+        aes256_ctr_vy128(&exk32, iv128, text, 4);
         for (j = 0; j < 512; ++j) {
             if (text[j] != expected[j]) {
                 printf("a2ct %x g %x, e %x\n", j, text[j], expected[j]);
             }
             assert(text[j] == expected[j]);
+        }
+        memcpy(iv128, iv16, 16);
+        aes256_ctr_vy(&exk32, iv128, text, 16);
+        for (j = 0; j < 512; ++j) {
+            if (text[j] != plain[j]) {
+                printf("a2pt %x g %x, e %x\n", j, text[j], plain[j]);
+            }
+            assert(text[j] == plain[j]);
         }
     }
 #endif

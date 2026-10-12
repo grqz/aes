@@ -8,7 +8,7 @@ typedef uint64_t u64;
 typedef void *p;
 
 extern
-u64 aes_ghash_sv(p subkey, p data, u64 dataLen);
+u64 aes_ghash(p subkey, p data, u64 dataLen);
 
 int main(void) {
     alignas(16) unsigned char s[16] = {
@@ -49,7 +49,7 @@ int main(void) {
     unsigned char expected[16] = {
         0xd5, 0xff, 0xcf, 0x6f, 0xc5, 0xac, 0x4d, 0x69, 0x72, 0x21, 0x87, 0x42, 0x1a, 0x7f, 0x17, 0x0b
     };
-    u64 ret = aes_ghash_sv(s, d, sizeof(d)>>4);
+    u64 ret = aes_ghash(s, d, sizeof(d)>>4);
     assert(ret == 7);
     for (int i = 0; i < 16; ++i) {
         printf("%02hhx%c", d[i], " \n"[i==15]);

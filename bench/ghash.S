@@ -14,26 +14,25 @@ bench_setup:
 %define BENCH_ITER 500_000_000
 %endif
     mov r14, BENCH_ITER 
+%if BENCH_MODE == 0
+    lea rdi, [rel d]
+%else
+    lea rsi, [rel xk]
+    lea rdi, [rel k]
+%endif
     ret
 
 bench_loop:
 %if BENCH_MODE == 0
-    lea rcx, [rel s]
-%else
-    lea rcx, [rel xk]
-    lea rdx, [rel k]
-%endif
-.lh:
-%if BENCH_MODE == 0
-    mov r8, 7
-    lea rdx, [rel d]
+    mov rdx, 7
+    lea rsi, [rel s]
     call aes_ghash
 %else
     call aes256_keyexpansion_aesni
 %endif
     dec r14
     test r14, r14
-    jnz .lh
+    jnz bench_loop
     jmp bench_end
 
 bench_cleanup:
