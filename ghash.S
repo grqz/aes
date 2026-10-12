@@ -14,14 +14,15 @@ global aes256_invcipher_aesni_sv
 global aes256_invcipher_aesni
 global aes256_ctr_vy_sv
 global aes256_ctr_vy
-global aes256_ctr_vy64_sv
+global aes256_ctr_vy128_sv
 
-%macro __trap 0
+%macro Trap 0
 %ifndef NDEBUG
     int3
 %endif
 %endmacro
 
+; TODO: determine calling convention at preprocessing time
 aes_ghash_win:
     movdqa [rsp + 8], xmm6
     call aes_ghash
@@ -90,7 +91,7 @@ aes_ghash:
     ; xmm2 = higher half to be reduced
     ; xmm5 = reduction constant, only has lq
 
-    vpclmullqlqdq xmm3, xmm2, xmm5
+    vpclmullqlqdq xmm3, xmm2, xmm5  ; TODO: reduce only once
         pclmulhqlqdq xmm2, xmm5
                 xorps xmm0, xmm3
             vpslldq xmm4, xmm2, 8
@@ -257,7 +258,7 @@ aes256_ctr_vy_sv:
     mov r9, rcx  ; r64 len of data in 32B chunks
     mov r8, rdx  ; *data RW:<32*len>B align 32
     mov rdx, rsi ; *iv R:16B RW:32B align 32
-    mov rcx, rdi ; *exk R:240B align 16
+    mov rcx, rdi ; *exk R:480B align 16
 ; Basic version, don't use.
 ; @func void (r64 r64 r64 r64)
 ; calling convention: win x64-ish
@@ -327,13 +328,13 @@ aes256_ctr_vy:
     vzeroupper
     ret
 
-; TODO: win64 wrapper as ymm6+ are volatile there
-aes256_ctr_vy64_sv:
-    mov r9, rcx  ; r64 len of data in 32B chunks
-    mov r8, rdx  ; *data RW:<32*len>B align 32
-    mov rdx, rsi ; *iv R:16B RW:64B align 32
-    mov rcx, rdi ; *exk R:240B align 32
-; AES-256-CTR crypt function operating in 64-byte blocks
+; TODO: win64 wrapper as xmm6+ are volatile there
+aes256_ctr_vy128_sv:
+    mov r9, rcx  ; r64 len
+    mov r8, rdx  ; *data RW:<128*len>B align 32
+    mov rdx, rsi ; *iv R:16B RW:128B align 32
+    mov rcx, rdi ; *exk R:480B align 32
+; AES-256-CTR crypt function operating in 128-byte blocks
 ; Slightly optimised.
 ; @func void (r64 r64 r64 r64)
 ; calling convention: win x64-ish
@@ -345,106 +346,130 @@ aes256_ctr_vy64_sv:
 ;     ymm12 ymm13 ymm14 ymm15
 ;     rax rcx rdx r8 r9 r10 r11
 ; no shadow space/redzone/stack alignment
-.aes256_ctr_vy64:
-    ; TODO: this may be optimised to read 128/256 bytes at a time
-    vmovdqa xmm5, [rel beshufb]
-    vinserti128 ymm5, ymm5, xmm5, 1
+; RegAlloc: (legacy -8 parallel 4 no spill volatile 0..10)
+;     ymm0: RoundKey
+;     ymm1..4: State & Temp
+;     ymm5: dq -8, 0, -8, 0
+;     ymm6..9: IV
+;     ymm10: Shuffle mask
+.aes256_ctr_vy128:
+    ; TODO: experiment with spilled IV 8 and vpcmpgtq
+    vmovdqa xmm10, [rel beshufb]
+    vinserti128 ymm10, ymm10, xmm10, 1
     vmovdqa xmm0, [rdx]
     ; "expand" IV for vecorised AES
 
     ; calculate carry. this is simple because we are adding one
-            pcmpeqw xmm2, xmm2
-            vpcmpeqq xmm2, xmm2, xmm0
-    pshufb xmm0, xmm5
-        mov eax, 1
-    mov r10, 2
-    movq xmm6, r10
-    ; inserts are limited to pre-loop
-    vinserti128 ymm6, ymm6, xmm6, 1
+            vpcmpeqw ymm1, ymm1, ymm1  ; -1
+            vpsrldq ymm1, ymm1, 8
+            vpsllq ymm5, ymm1, 1  ; -2
+    pshufb xmm0, xmm10
+            vpcmpeqq xmm2, xmm0, xmm1
             pslldq xmm2, 8
-        movd xmm1, eax
-        paddq xmm1, xmm0
+        vpsubq xmm1, xmm0, xmm1
         ; subtract mask = add carry
         psubq xmm1, xmm2
-        vinserti128 ymm0, ymm0, xmm1, 1
-        vmovdqa [rdx], ymm0
-        vpshufb ymm0, ymm0, ymm5
+        ; inserts are limited to pre-loop
+        vinserti128 ymm6, ymm0, xmm1, 1
+        vpshufb ymm1, ymm6, ymm10
 
     ; BEGIN: ymm1 = ymm0 + 2
-        vpsrlq ymm3, ymm6, 1   ; 2 1s, one in each lane
-    vpaddq ymm1, ymm0, ymm6
-            vpsllq ymm6, ymm6, 1   ; ymm6 contains 2 4s one in each lane
-    ; carry when the (X & 1) == X (see NOTE section below)
-        vpand ymm3, ymm3, ymm1
-        vpcmpeqq ymm3, ymm3, ymm1
-        vpslldq ymm3, ymm3, 8  ; discard carry from high q
+        vpand ymm2, ymm6, ymm5
+    vpsubq ymm7, ymm6, ymm5
+        vpcmpeqq ymm2, ymm2, ymm5
+        vpslldq ymm2, ymm2, 8  ; discard carry from high q
+    vpsllq ymm5, ymm5, 1  ; -4
         ; masks can be subtracted because x - (-1) = x + 1
-        vpsubq ymm1, ymm3
+        vpsubq ymm7, ymm7, ymm2
+    ; start +4
+    vpand ymm3, ymm6, ymm5
+        vpand ymm4, ymm7, ymm5
+            vpsubq ymm8, ymm6, ymm5
+                vpsubq ymm9, ymm7, ymm5
+        ; don't shuffle in place, so that the value is ready for increment at
+        ; the end of the loop
+        vpshufb ymm2, ymm7, ymm10
 
-        vmovdqa [rdx + 0x20], ymm1
-        ; shuffle back AFTER store, so that the value is ready for increment
-        ; once its loaded, this minimises shuffles
-        ; TODO: maybe we shouldn't store back to memory at all?
-        vpshufb ymm1, ymm1, ymm5
+    vpcmpeqq ymm3, ymm3, ymm5
+        vpcmpeqq ymm4, ymm4, ymm5
+    vpslldq ymm3, ymm3, 8
+        vpslldq ymm4, ymm4, 8
+            vpsllq ymm5, ymm5, 1  ; -8
+    vpsubq ymm8, ymm8, ymm3
+        vpsubq ymm9, ymm9, ymm4
+    vpshufb ymm3, ymm8, ymm10
+        vpshufb ymm4, ymm9, ymm10
 
 .back:
-    ; now: ymm0 = IV 0,1, ymm1 = IV 2,3 (both mod 4)
-    vmovaps ymm2, [rcx]  ; load first round key
-    vxorps ymm0, ymm0, ymm2
-        vxorps ymm1, ymm1, ymm2
+    vmovaps ymm0, [rcx]  ; load first round key
+    vxorps ymm1, ymm1, ymm0
+        vxorps ymm2, ymm2, ymm0
+            vxorps ymm3, ymm3, ymm0
+                vxorps ymm4, ymm4, ymm0
 %define OFFSET 0x20
 %rep 13
-    vmovaps ymm2, [rcx + OFFSET]
-    vaesenc ymm0, ymm0, ymm2
-        vaesenc ymm1, ymm1, ymm2
+    vmovaps ymm0, [rcx + OFFSET]
+    vaesenc ymm1, ymm1, ymm0
+        vaesenc ymm2, ymm2, ymm0
+            vaesenc ymm3, ymm3, ymm0
+                vaesenc ymm4, ymm4, ymm0
 %assign OFFSET OFFSET+0x20
 %endrep
-    vmovaps ymm2, [rcx + OFFSET]
-    vaesenclast ymm0, ymm0, ymm2
-        vaesenclast ymm1, ymm1, ymm2
+    vmovaps ymm0, [rcx + OFFSET]
+    vaesenclast ymm1, ymm1, ymm0
+        vaesenclast ymm2, ymm2, ymm0
+            vaesenclast ymm3, ymm3, ymm0
+                vaesenclast ymm4, ymm4, ymm0
 %undef OFFSET
 
-    vxorps ymm0, [r8]
-        vxorps ymm1, [r8 + 0x20]
-    vmovaps [r8], ymm0
-        vmovaps [r8 + 0x20], ymm1
+    vxorps ymm1, [r8]
+        vxorps ymm2, [r8 + 0x20]
+            vxorps ymm3, [r8 + 0x40]
+                vxorps ymm4, [r8 + 0x60]
+    vmovaps [r8], ymm1
+        vmovaps [r8 + 0x20], ymm2
+            vmovaps [r8 + 0x40], ymm3
+                vmovaps [r8 + 0x60], ymm4
 
-    ; load and inc IV
-    vmovdqa ymm0, [rdx]
-        vmovdqa ymm1, [rdx + 0x20]
+    ; inc IV
+    ; BEGIN: ymm6..9 += ymm5 clobber 1..4
+                    vpand ymm1, ymm6, ymm5
+                        vpand ymm2, ymm7, ymm5
+                            vpand ymm3, ymm8, ymm5
+                                vpand ymm4, ymm9, ymm5
+    vpsubq ymm6, ymm6, ymm5
+        vpsubq ymm7, ymm7, ymm5
+            vpsubq ymm8, ymm8, ymm5
+                vpsubq ymm9, ymm9, ymm5
+                    vpcmpeqq ymm1, ymm1, ymm5
+                        vpcmpeqq ymm2, ymm2, ymm5
+                            vpcmpeqq ymm3, ymm3, ymm5
+                                vpcmpeqq ymm4, ymm4, ymm5
+                    vpslldq ymm1, ymm1, 8
+                        vpslldq ymm2, ymm2, 8
+                            vpslldq ymm3, ymm3, 8
+                                vpslldq ymm4, ymm4, 8
+                    vpsubq ymm6, ymm6, ymm1
+                        vpsubq ymm7, ymm7, ymm2
+                            vpsubq ymm8, ymm8, ymm3
+                                vpsubq ymm9, ymm9, ymm4
+    ; END: ymm6..9 += ymm5
 
-    ; BEGIN: ymm0 += 4, ymm1 += 4 clobber 3 4
-    vpaddq ymm0, ymm0, ymm6
-        vpaddq ymm1, ymm1, ymm6
-    ; NOTE on testing carry with unroll factor 4:
-    ; In general, addition carry is performed when A + B < A where < denotes
-    ; unsigned less/below. In this case, we want to test for each ymm, whether
-    ; the lower qwords are within the range [0, 3]. We should not use VPCMPGTQ
-    ; as that gives us signed comparison. Instead, we rely on the fact that 4
-    ; is a power of two, and when (X & 3) == X, X must be one of 0, 1, 2, 3.
-    vpcmpeqw ymm3, ymm3, ymm3
-    vpsrlq ymm3, ymm3, 62      ; ymm3 is 3(s)
-        vpand ymm4, ymm3, ymm1
-    vpand ymm3, ymm3, ymm0
-        vpcmpeqq ymm4, ymm4, ymm1
-    vpcmpeqq ymm3, ymm3, ymm0
-        vpslldq ymm4, ymm4, 8
-    vpslldq ymm3, ymm3, 8  ; discard carry from high q
-        vpsubq ymm1, ymm1, ymm4
-    vpsubq ymm0, ymm0, ymm3
-    ; END: ymm0 += 4, ymm1 += 4
+                    vpshufb ymm1, ymm6, ymm10
+                        vpshufb ymm2, ymm7, ymm10
+                            vpshufb ymm3, ymm8, ymm10
+                                vpshufb ymm4, ymm9, ymm10
 
-        vmovdqa [rdx + 0x20], ymm1
-    vmovdqa [rdx], ymm0
-        vpshufb ymm1, ymm1, ymm5
-    vpshufb ymm0, ymm0, ymm5
-
-    add r8, 0x40
+    add r8, 0x80
     dec r9
     test r9, r9
 
     jnz .back
 
+    vmovaps [rdx], ymm6
+        vmovaps [rdx + 0x20], ymm7
+            vmovaps [rdx + 0x40], ymm8
+                vmovaps [rdx + 0x60], ymm9
     vzeroupper  ; for performance
     ret
 
