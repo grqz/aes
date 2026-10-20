@@ -2,6 +2,7 @@ BITS 64
 section .text
 
 global aes_ghash
+global aes_ghash_s2
 global aes256_keyexpansion_aesni
 global aes256_keyexpansion_aesni_32
 global aes256_cipher_aesni
@@ -46,6 +47,199 @@ global aes256_ctr_vy128
 %define P3 rcx
 %endif
 
+; GHASH:
+;   r(chunks.reduce(chunk=>red((last + r(chunk)) * r(H)), 0))
+; #Calculations:
+; r: 2 + chunk.length
+; clmul128: chunk.length
+; red256: chunk.length
+; add128: chunk.length
+; Storage: 1 (last)
+;
+; Unroll 2:
+;   r((chunkedChunks.reduce(
+;         ([chunk0, chunk1])=>
+;           red(chunk1
+;             ? (red((last + r(chunk0)) * r(H)) + r(chunk1)) * r(H)
+;             : (last + r(chunk0)) * r(H)),
+;         0))
+;
+; Expand:
+;   r((chunkedChunks.reduce(
+;         ([chunk0, chunk1])=>
+;           red(chunk1
+;             ? (last + r(chunk0)) * red(r(H) * r(H)) + r(chunk1) * r(H)
+;             : (last + r(chunk0)) * r(H)),
+;         0))
+; ^ red(pow(r(H), N)) is loop-invariant, hence:
+; generally we could benefit from unrolling and caching red(pow(r(H), N))
+; #Calc: (even chunk.length)
+; r: 2 + chunk.length
+; clmul128: chunk.length
+; red256: 1 + chunk.length/2
+; add128: chunk.length/2
+; add256: chunk.length/2
+;
+; Unroll 100%:
+;   r(Sum(red(red(pow(r(H), (chunks.length - i))) * r(chunk)) for i, chunk in enumerate(chunks)))
+; unroll factor 2, reduce once per iteration
+; _slightly_ optimised. >90% speedup over the ordinary version
+; there is space for further optimisation
+; TODO: make it even more "parallel"
+; P0 *subkey R:16B align 16
+; P1 *data W:16B R:<16*len>B align 32
+; P2 r64 len
+; @func r64 (r64 r64 r64)
+; return rax
+; scratch
+;     xmm0 xmm1 xmm2 xmm3
+;     xmm4 xmm5 xmm6
+;     rax r10 r11
+; no shadow space/redzone
+; stack alignment: 16 precall
+aes_ghash_s2:
+    movdqa xmm1, [P0]  ; H
+    movdqa xmm5, [rel rhi]
+    vpsrlq xmm4, xmm5, 4
+    xor eax, eax
+    vpxor ymm2, ymm2, ymm2
+
+    WIN_SAVEX 8, xmm6
+    movdqa xmm6, [rel affine_mat]
+    vinserti128 ymm6, ymm6, xmm6, 1
+    WIN_SAVEX 0x18, xmm7
+    mov P3, 0x87
+    movq xmm7, P3
+
+    cmp P2, 2
+    mov P3, P1
+    jb .single
+
+    ; affine 3/0.5, unpck 1/.5
+    ;01234
+    ; --- affine
+    ; --- affine
+    ;  --- affine 1
+    ;    - unpck
+    ;    - unpck
+
+    vgf2p8affineqb xmm0, xmm1, xmm5, 0
+    vgf2p8affineqb xmm3, xmm1, xmm4, 0
+    gf2p8affineqb xmm1, xmm6, 0
+
+    ; the lower xmm comes first(xmm0)
+    vpunpcklbw xmm2, xmm0, xmm3  ; lsh 0
+    vpunpckhbw xmm3, xmm0, xmm3  ; lsh 2
+    ; squaring is faster this way
+    ; xmm3 is to be reduced by xmm7
+
+    ; clmul 3/1, shift 1/0.5, xor 1/0.33, insert 1/1
+    ;012345678
+    ; --- 4=clmul hl
+    ;  --- 3=clmul ll
+    ;    - 5=<<x
+    ;    --- 4_1=clmul hl
+    ;     - 2_1=^x
+    ;      - 2_2=^x
+    ;       - 2_3=^x
+    ;        - 1=insert
+    vpclmulhqlqdq xmm4, xmm3, xmm7  ; 72 lsh 1
+    pclmullqlqdq xmm3, xmm7  ; lsh 0
+    vpslldq xmm5, xmm4, 8  ; lsh 0
+    pclmulhqlqdq xmm4, xmm7  ; 16 lsh 0
+    ; we want to xor xmm2, xmm3, xmm5, and xmm4
+    pxor xmm2, xmm5
+    pxor xmm2, xmm4
+    pxor xmm2, xmm3
+
+    vinserti128 ymm1, ymm2, xmm1, 1
+    vpxor ymm2, ymm2, ymm2
+
+    ; now:
+    ; ymm1.dq[0]: H*H
+    ; ymm1.dq[1]: H
+    ; xmm6: affine_mat
+    ; xmm7: red k
+.loop:
+    ;01234567890
+    ; ------
+    ;       ---
+    ;          -
+    vmovdqa ymm0, [P1]
+    vgf2p8affineqb ymm0, ymm0, ymm6, 0
+    vpxor ymm0, ymm0, ymm2
+    ; v?pclmulqdq p5 3/1
+    ; v?pxor src1 != src2: p015 1/0.33
+    ; v?pxor src1 == src2: p015 0/0.17
+    ; v?p(?:s[lr]ld?q|shufd): p15 1/0.5
+    ; vperm2i128: p5 3/1
+    ;   0               1
+    ; P 0123456789abcdef0123456789abcdef
+    ; 5  ---
+    vpclmulhqlqdq ymm2, ymm0, ymm1
+    ; 5   ---
+    vpclmullqhqdq ymm3, ymm0, ymm1
+    ; 5    ---
+    vpclmulhqhqdq ymm4, ymm0, ymm1
+    ; 5     ---
+    vpclmullqlqdq ymm0, ymm0, ymm1
+    ; 0      -
+    vpxor ymm2, ymm2, ymm3
+    ; 5       -
+    vpslldq ymm3, ymm2, 8
+    ; 1       -
+    vpsrldq ymm2, ymm2, 8
+    ; 5        -
+    vpxor ymm0, ymm0, ymm3
+    ; 1        -
+    vpxor ymm4, ymm4, ymm2
+    ; 5         ---
+    vperm2i128 ymm2, ymm4, ymm4, 0x01
+    ; 5          ---
+    vperm2i128 ymm3, ymm0, ymm0, 0x01
+    ; 5            -
+    vpxor ymm4, ymm4, ymm2
+    ; at this point: we have one whole xword to be reduced
+    ; hq*lq = 71b lsh 1q needs to be double reduced
+    ; 5             ---
+    vpclmulhqlqdq xmm2, xmm4, xmm7
+    ; 0             -
+    vpxor ymm0, ymm0, ymm3
+    ; 5              ---
+    vpclmullqlqdq xmm4, xmm4, xmm7  ; ll lsh 0 ready to merge
+    ; 5                ---
+    vpclmulhqlqdq xmm3, xmm2, xmm7  ; lsh 0
+    ; 1                -
+    vpslldq xmm2, xmm2, 8  ; lsh 0
+    ; 5                 -
+    vpxor xmm2, xmm2, xmm0
+    ; 5                  -
+    vpxor xmm2, xmm2, xmm4
+
+    ; 6b                  -
+    add rax, 2
+    ; 0                   -
+    add P1, 0x20
+    ; 5                   -
+    sub P2, 2
+    ; 1                   -
+    vpxor xmm2, xmm2, xmm3
+    cmp P2, 2
+    jae .loop
+
+.single:
+    test P2, P2
+    jz .ret
+    int3  ; TODO
+
+    WIN_LOADX 8, xmm6
+    WIN_LOADX 0x18, xmm7
+.ret:
+    gf2p8affineqb xmm2, xmm6, 0
+    movdqa [P3], xmm2
+    ret
+
+; Baseline GHASH
 ; P0 *subkey R:16B align 16
 ; P1 *data W:16B R:<16*len>B align 16
 ; P2 r64 len
@@ -55,14 +249,15 @@ global aes256_ctr_vy128
 ;     xmm0 xmm1 xmm2 xmm3
 ;     xmm4 xmm5 xmm6
 ;     rax r10 r11
-; no shadow space/redzone/stack alignment
+; no shadow space/redzone
+; stack alignment: 16 precall
 ; benchmark (7 blocks):
 ; P-core: 37.402ns
 ; E-core: 52.722ns
 aes_ghash:
     xor eax, eax
     test P2, P2
-    jz .errout
+    jz .ret
     WIN_SAVEX 8, xmm6
 
     movdqa xmm6, [rel affine_mat]
@@ -109,11 +304,11 @@ aes_ghash:
     ; xmm5 = red const
 
     vpclmullqlqdq xmm3, xmm2, xmm5  ; reduce accumulated higher half (lqlq lsh 0)
-        pclmulhqlqdq xmm2, xmm5  ; 72 bits lsh 1q! one more reduction required
+        pclmulhqlqdq xmm2, xmm5  ; 71 bits lsh 1q! one more reduction required
             vpslldq xmm4, xmm2, 8  ; deal with the lsh of the lower q
                 pxor xmm3, xmm4  ; eat it
-        pclmulhqlqdq xmm2, xmm5  ; 64b * 8b = 72b, double reduce
-        ; just a 8bx8b/qxq, xmm5 should be 16b/w or less
+        pclmulhqlqdq xmm2, xmm5  ; 64b * 8b = 71b, double reduce
+        ; just a 7bx8b, xmm5 should be 14b
                 ;pxor xmm3, xmm2  ; then eat double reduced too
                 pxor xmm2, xmm3
 
@@ -126,7 +321,7 @@ aes_ghash:
     gf2p8affineqb xmm0, xmm6, 0
     movdqa [P3], xmm0
     WIN_LOADX 8, xmm6
-.errout:
+.ret:
     ret
 
 ; P0 *kexp RW:240B align 16
@@ -136,7 +331,8 @@ aes_ghash:
 ;     xmm0 xmm1 xmm2 xmm3
 ;     xmm4 xmm5
 ;     rax r10 r11
-; no shadow space/redzone/stack alignment
+; no shadow space/redzone
+; stack alignment: 16 precall
 ; benchmark: (for some reason the E-core is faster)
 ; P-core: 47.552ns
 ; E-core: 21.263ns
@@ -192,7 +388,8 @@ aes256_keyexpansion_aesni:
 ;     xmm0 xmm1 xmm2 xmm3
 ;     xmm4 xmm5
 ;     rax r10 r11
-; no shadow space/redzone/stack alignment
+; no shadow space/redzone
+; stack alignment: 16 precall
 aes256_keyexpansion_aesni_32:
                 movdqa xmm0, [P1 + 0x10]
             movdqa xmm1, [P1]
@@ -250,7 +447,8 @@ aes256_keyexpansion_aesni_32:
 ;     xmm0 xmm1 xmm2 xmm3
 ;     xmm4 xmm5
 ;     rax r10 r11
-; no shadow space/redzone/stack alignment
+; no shadow space/redzone
+; stack alignment: 16 precall
 aes256_cipher_aesni:
     movdqa xmm0, [P0]
     pxor xmm0, [P1]
@@ -274,7 +472,8 @@ aes256_cipher_aesni:
 ;     ymm0 ymm1 ymm2 ymm3
 ;     ymm4 ymm5
 ;     rax r10 r11
-; no shadow space/redzone/stack alignment
+; no shadow space/redzone
+; stack alignment: 16 precall
 aes256_ctr_vy:
     vmovdqa xmm5, [rel beshufb]
     vinserti128 ymm5, ymm5, xmm5, 1
@@ -351,7 +550,8 @@ aes256_ctr_vy:
 ;     ymm8 ymm9 ymm10 ymm11
 ;     ymm12 ymm13 ymm14 ymm15
 ;     rax r10 r11
-; no shadow space/redzone/stack alignment
+; no shadow space/redzone
+; stack alignment: 16 precall
 ; RegAlloc:
 ;     ymm0: RoundKey
 ;     ymm1..4: State & Temp
@@ -498,3 +698,13 @@ affine_mat:
     db 2 dup (1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80)
 beshufb:
     db 0xf, 0xe, 0xd, 0xc, 0xb, 0xa, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+; rev-hi, two transformations in a single instruction
+; gf2p8affineqb has a high latency, so we want to do EVERYTHING in parallel
+;    0 1 2 3 4 5 6 7
+; hi:
+; 0x0800040002000100
+; lo:
+; 0x8000400020001000
+rhi:
+; NOTE: this is interpreted as LE
+    dq 2 dup(0x8000400020001000)

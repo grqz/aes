@@ -3,12 +3,13 @@
 #include <assert.h>
 #include <stdalign.h>
 #include <stdio.h>
+#include <string.h>
 
 typedef uint64_t u64;
 typedef void *p;
 
-extern
-u64 aes_ghash(p subkey, p data, u64 dataLen);
+extern u64 aes_ghash(p subkey, p data, u64 dataLen);
+extern u64 aes_ghash_s2(p subkey, p data, u64 dataLen);
 
 int main(void) {
     alignas(16) unsigned char s[16] = {
@@ -16,7 +17,8 @@ int main(void) {
         0x79, 0xb4, 0xb8, 0xeb,
         0xce, 0x88, 0x9b, 0xac,
         0x87, 0x32, 0xda, 0xd7
-    },  d[] = {
+    };
+    static const unsigned char constd[] = {
         0xfe, 0xed, 0xfa, 0xce,
         0xde, 0xad, 0xbe, 0xef,
         0xfe, 0xed, 0xfa, 0xce,
@@ -46,10 +48,15 @@ int main(void) {
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x01, 0xe0
     };
+    alignas(32) unsigned char d[sizeof constd];
+    memcpy(d, constd, sizeof constd);
     unsigned char expected[16] = {
         0xd5, 0xff, 0xcf, 0x6f, 0xc5, 0xac, 0x4d, 0x69, 0x72, 0x21, 0x87, 0x42, 0x1a, 0x7f, 0x17, 0x0b
     };
-    u64 ret = aes_ghash(s, d, sizeof(d)>>4);
+    unsigned char expected_trun[16] = {
+        0xcc, 0x9a, 0xe9, 0x17, 0x57, 0x29, 0xa6, 0x49, 0x93, 0x6e, 0x89, 0x0b, 0xd9, 0x71, 0xa8, 0xbf
+    };
+    u64 ret = aes_ghash(s, d, 7);
     for (int i = 0; i < 16; ++i)
         printf("%02hhx%c", d[i], " \n"[i==15]);
     for (int i = 0; i < 16; ++i) {
@@ -58,5 +65,14 @@ int main(void) {
         assert(d[i] == expected[i]);
     }
     assert(ret == (sizeof(d)>>4));
-    return ret != (sizeof(d)>>4) && EXIT_FAILURE;
+    memcpy(d, constd, sizeof constd);
+    ret = aes_ghash_s2(s, d, 6);
+    for (int i = 0; i < 16; ++i)
+        printf("%02hhx%c", d[i], " \n"[i==15]);
+    for (int i = 0; i < 16; ++i) {
+        if (d[i] != expected_trun[i])
+            printf("\n/%x got %x, exp %x\n", i, d[i], expected_trun[i]);
+        assert(d[i] == expected_trun[i]);
+    }
+    assert(ret == 6);
 }

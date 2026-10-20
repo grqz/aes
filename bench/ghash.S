@@ -4,6 +4,7 @@ section .text
 extern aes256_keyexpansion_aesni
 extern aes256_ctr_vy128
 extern aes_ghash
+extern aes_ghash_s2
 extern bench_priu64
 extern bench_end
 global bench_setup
@@ -14,8 +15,11 @@ global bench_cleanup
 %define B_EXK256 1
 %define B_CTR64K 2
 %define B_GHASH64K 3
+%define B_GHASH64KS2 4
 
 bench_setup:
+; we rely on the fragile fact that these registers are loop invariant
+; i wanted to reduce loop overhead but in practice this probably wouldn't matter
 %ifndef BENCH_ITER
 %define BENCH_ITER 500_000_000
 %endif
@@ -29,7 +33,9 @@ bench_setup:
     lea rdi, [rel yexk]
     lea rsi, [rel iv128]
 %elif BENCH_MODE == B_GHASH64K
-    lea rdi, [rel y64kzeros]
+    lea rdi, [rel s]
+%elif BENCH_MODE == B_GHASH64KS2
+    lea rdi, [rel s]
 %else
     %error "we need something to bench. look at the B_ constants"
 %endif
@@ -48,8 +54,12 @@ bench_loop:
     call aes256_ctr_vy128
 %elif BENCH_MODE == B_GHASH64K
     mov rdx, 4096
-    lea rsi, [rel s]
+    lea rsi, [rel y64kzeros]
     call aes_ghash
+%elif BENCH_MODE == B_GHASH64KS2
+    mov rdx, 4096
+    lea rsi, [rel y64kzeros]
+    call aes_ghash_s2
 %endif
     dec r14
     test r14, r14
